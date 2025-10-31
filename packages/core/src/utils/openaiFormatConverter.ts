@@ -9,64 +9,14 @@ import {
   GenerateContentParameters,
   FinishReason,
   Part,
-  Content,
-  Tool,
-  ToolListUnion,
-  CallableTool,
   FunctionCall,
   FunctionResponse,
 } from '@google/genai';
 import type {
   ChatCompletion,
   ChatCompletionChunk,
+  OpenAIRequestFormat,
 } from 'openai/resources/chat/index.js';
-
-// OpenAI API type definitions for conversions
-export interface OpenAIToolCall {
-  id: string;
-  type: 'function';
-  function: {
-    name: string;
-    arguments: string;
-  };
-}
-
-export interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
-  tool_calls?: OpenAIToolCall[];
-  tool_call_id?: string;
-}
-
-export interface OpenAIUsage {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-}
-
-export interface OpenAIChoice {
-  index: number;
-  message: OpenAIMessage;
-  finish_reason: string;
-}
-
-export interface OpenAIRequestFormat {
-  model: string;
-  messages: OpenAIMessage[];
-  temperature?: number;
-  max_tokens?: number;
-  top_p?: number;
-  tools?: unknown[];
-}
-
-export interface OpenAIResponseFormat {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: OpenAIChoice[];
-  usage?: OpenAIUsage;
-}
 
 /**
  * Utility class for converting between OpenAI and Gemini API formats
@@ -118,8 +68,8 @@ export class OpenAIFormatConverter {
         
           // Handle text parts
           const textParts = (content.parts || [])
-            .filter((part: any): part is { text: string } => 'text' in part)
-            .map((part: any) => part.text)
+            .filter((part): part is { text: string } => 'text' in part)
+            .map((part) => part.text)
             .join('\n');
 
           if (textParts) {
@@ -131,15 +81,15 @@ export class OpenAIFormatConverter {
 
           // Handle function calls and responses
           const functionCalls = (content.parts || []).filter(
-            (part: any): part is FunctionCall => 'functionCall' in part
+            (part): part is FunctionCall => 'functionCall' in part
           );
 
           const functionResponses = (content.parts || []).filter(
-            (part: any): part is FunctionResponse => 'functionResponse' in part
+            (part): part is FunctionResponse => 'functionResponse' in part
           );
 
           if (functionCalls.length > 0) {
-            const tool_calls = functionCalls.map((fc: any, index: number) => ({
+            const tool_calls = functionCalls.map((fc, index) => ({
               id: `call_${Date.now()}_${index}`,
               type: 'function' as const,
               function: {
@@ -210,7 +160,7 @@ export class OpenAIFormatConverter {
           parts.push({
             functionCall: {
               name: toolCall.function.name,
-              args: JSON.parse(toolCall.function.arguments || '{}'),
+              args: this.safeJsonParse(toolCall.function.arguments || '{}'),
             },
           });
         }
@@ -265,7 +215,7 @@ export class OpenAIFormatConverter {
             functionCall: {
               name: toolCall.function.name || '',
               args: toolCall.function.arguments
-                ? JSON.parse(toolCall.function.arguments)
+                ? this.safeJsonParse(toolCall.function.arguments)
                 : {},
             },
           });
@@ -397,5 +347,116 @@ export class OpenAIFormatConverter {
     }
 
     return mergedMessages;
+  }
+
+  /**
+   * Safely parse JSON with fallback handling for malformed input
+   */
+  private static safeJsonParse(input: string): Record<string, unknown> {
+    try {
+      return JSON.parse(input);
+    } catch {
+      // If that fails, try to find valid JSON patterns
+      return this.extractPartialJson(input);
+    }
+  }
+
+  /**
+   * Extract valid JSON from potentially partial JSON string
+   * This handles cases where streaming chunks contain incomplete JSON
+   */
+  private static extractPartialJson(input: string): Record<string, unknown> {
+    if (!input || typeof input !== 'string') {
+      return {};
+    }
+
+    // First try to parse the entire string
+    try {
+      return JSON.parse(input);
+    } catch {
+      // If that fails, try to find valid JSON patterns
+    }
+
+    // Try to find a complete JSON object in the string
+    const trimmed = input.trim();
+    
+    // Check if it looks like a complete object
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      // Try to parse character by character to find where it breaks
+      let braceCount = 0;
+      let inString = false;
+      let escapeNext = false;
+      
+      for (let i = 0; i < trimmed.length; i++) {
+        const char = trimmed[i];
+        
+        if (escapeNext) {
+          escapeNext = false;
+          continue;
+        }
+        
+        if (char === '\\') {
+          escapeNext = true;
+          continue;
+        }
+        
+        if (char === '"' && !escapeNext) {
+          inString = !inString;
+          continue;
+        }
+        
+        if (!inString) {
+          if (char === '{') braceCount++;
+          else if (char === '}') braceCount--;
+          
+          // If we have balanced braces and are at the end, try parsing
+          if (braceCount === 0 && i === trimmed.length - 1) {
+            try {
+              return JSON.parse(trimmed);
+            } catch {
+              // Still not valid, continue
+            }
+          }
+        }
+      }
+    }
+
+    // Try to extract key-value pairs manually for simple cases
+    const keyValuePattern = /"([^"]+)"\s*:\s*("([^"]*)"|([0-9.]+)|(true|false)|(null))/g;
+    const matches = [...trimmed.matchAll(keyValuePattern)];
+    
+    if (matches.length > 0) {
+      const result: Record<string, unknown> = {};
+      
+      for (const match of matches) {
+        const key = match[1];
+        let value: unknown;
+        
+        if (match[3] !== undefined) {
+          // String value
+          value = match[3];
+        } else if (match[4] !== undefined) {
+          // Number value
+          value = parseFloat(match[4]);
+          if (Number.isNaN(value)) {
+            value = match[4];
+          }
+        } else if (match[5] !== undefined) {
+          // Boolean value
+          value = match[5] === 'true';
+        } else if (match[6] !== undefined) {
+          // Null value
+          value = null;
+        }
+        
+        result[key] = value;
+      }
+      
+      return result;
+    }
+
+    // Last resort: return an empty object rather than throwing
+    console.warn('Could not extract valid JSON from:', input);
+    return {};
   }
 }

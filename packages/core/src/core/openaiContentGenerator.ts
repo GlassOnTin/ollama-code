@@ -140,14 +140,14 @@ export class OpenAIContentGenerator implements ContentGenerator {
   /**
    * Reinitialize the OpenAI client with current environment variables
    */
-  public updateClient(): void {
+  updateClient(): void {
     this.initializeClient();
   }
 
   /**
    * Update the model being used
    */
-  public updateModel(model: string): void {
+  updateModel(model: string): void {
     this.model = model;
     console.log('[DEBUG] Updated model to:', this.model);
   }
@@ -1154,7 +1154,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
               args = JSON.parse(toolCall.function.arguments);
             } catch (error) {
               console.error('Failed to parse function arguments:', error);
-              args = {};
+              console.error('Problematic arguments:', toolCall.function.arguments);
+              // Try to extract partial JSON or provide a fallback
+              args = this.extractPartialJson(toolCall.function.arguments) || {};
             }
           }
 
@@ -1273,6 +1275,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
                   'Failed to parse final tool call arguments:',
                   error,
                 );
+                console.error('Problematic accumulated arguments:', accumulatedCall.arguments);
+                // Try to extract partial JSON or provide a fallback
+                args = this.extractPartialJson(accumulatedCall.arguments) || {};
               }
             }
 
@@ -1402,6 +1407,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
     return params;
   }
 
+  /**
+   * Map OpenAI finish reasons to Gemini finish reasons
+   */
   private mapFinishReason(openaiReason: string | null): FinishReason {
     if (!openaiReason) return FinishReason.FINISH_REASON_UNSPECIFIED;
     const mapping: Record<string, FinishReason> = {
@@ -1412,6 +1420,33 @@ export class OpenAIContentGenerator implements ContentGenerator {
       tool_calls: FinishReason.STOP,
     };
     return mapping[openaiReason] || FinishReason.FINISH_REASON_UNSPECIFIED;
+  }
+
+  /**
+   * Map Gemini finish reasons to OpenAI finish reasons
+   */
+  private mapGeminiFinishReasonToOpenAI(geminiReason?: unknown): string {
+    if (!geminiReason) return 'stop';
+
+    switch (geminiReason) {
+      case 'STOP':
+      case 1: // FinishReason.STOP
+        return 'stop';
+      case 'MAX_TOKENS':
+      case 2: // FinishReason.MAX_TOKENS
+        return 'length';
+      case 'SAFETY':
+      case 3: // FinishReason.SAFETY
+        return 'content_filter';
+      case 'RECITATION':
+      case 4: // FinishReason.RECITATION
+        return 'content_filter';
+      case 'OTHER':
+      case 5: // FinishReason.OTHER
+        return 'stop';
+      default:
+        return 'stop';
+    }
   }
 
   /**
@@ -1790,29 +1825,104 @@ export class OpenAIContentGenerator implements ContentGenerator {
   }
 
   /**
-   * Map Gemini finish reasons to OpenAI finish reasons
+   * Extract valid JSON from potentially partial JSON string
+   * This handles cases where streaming chunks contain incomplete JSON
    */
-  private mapGeminiFinishReasonToOpenAI(geminiReason?: unknown): string {
-    if (!geminiReason) return 'stop';
-
-    switch (geminiReason) {
-      case 'STOP':
-      case 1: // FinishReason.STOP
-        return 'stop';
-      case 'MAX_TOKENS':
-      case 2: // FinishReason.MAX_TOKENS
-        return 'length';
-      case 'SAFETY':
-      case 3: // FinishReason.SAFETY
-        return 'content_filter';
-      case 'RECITATION':
-      case 4: // FinishReason.RECITATION
-        return 'content_filter';
-      case 'OTHER':
-      case 5: // FinishReason.OTHER
-        return 'stop';
-      default:
-        return 'stop';
+  private extractPartialJson(input: string): Record<string, unknown> | null {
+    if (!input || typeof input !== 'string') {
+      return null;
     }
+
+    // First try to parse the entire string
+    try {
+      return JSON.parse(input);
+    } catch {
+      // If that fails, try to find valid JSON patterns
+    }
+
+    // Try to find a complete JSON object in the string
+    // This handles cases like: {"key": "value_partial
+    // or: {"key": "value"}
+    const trimmed = input.trim();
+    
+    // Check if it looks like a complete object
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      // Try to parse character by character to find where it breaks
+      let braceCount = 0;
+      let inString = false;
+      let escapeNext = false;
+      
+      for (let i = 0; i < trimmed.length; i++) {
+        const char = trimmed[i];
+        
+        if (escapeNext) {
+          escapeNext = false;
+          continue;
+        }
+        
+        if (char === '\\') {
+          escapeNext = true;
+          continue;
+        }
+        
+        if (char === '"' && !escapeNext) {
+          inString = !inString;
+          continue;
+        }
+        
+        if (!inString) {
+          if (char === '{') braceCount++;
+          else if (char === '}') braceCount--;
+          
+          // If we have balanced braces and are at the end, try parsing
+          if (braceCount === 0 && i === trimmed.length - 1) {
+            try {
+              return JSON.parse(trimmed);
+            } catch {
+              // Still not valid, continue
+            }
+          }
+        }
+      }
+    }
+
+    // Try to extract key-value pairs manually for simple cases
+    // This handles: key1="value1",key2="value2" 
+    const keyValuePattern = /"([^"]+)"\s*:\s*("([^"]*)"|([0-9.]+)|(true|false)|(null))/g;
+    const matches = [...trimmed.matchAll(keyValuePattern)];
+    
+    if (matches.length > 0) {
+      const result: Record<string, unknown> = {};
+      
+      for (const match of matches) {
+        const key = match[1];
+        let value: unknown;
+        
+        if (match[3] !== undefined) {
+          // String value
+          value = match[3];
+        } else if (match[4] !== undefined) {
+          // Number value
+          value = parseFloat(match[4]);
+          if (Number.isNaN(value)) {
+            value = match[4];
+          }
+        } else if (match[5] !== undefined) {
+          // Boolean value
+          value = match[5] === 'true';
+        } else if (match[6] !== undefined) {
+          // Null value
+          value = null;
+        }
+        
+        result[key] = value;
+      }
+      
+      return result;
+    }
+
+    // Last resort: return an empty object rather than throwing
+    console.warn('Could not extract valid JSON from:', input);
+    return null;
   }
 }
