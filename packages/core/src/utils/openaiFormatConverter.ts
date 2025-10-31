@@ -1,4 +1,11 @@
 /**
+ * @fileoverview
+ * OpenAI Format Converter Utility
+ * 
+ * This module provides utilities for converting between Google's Gemini API format
+ * and OpenAI's chat completion format. It handles the translation of messages,
+ * tools, and responses between the two different API schemas.
+ * 
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
@@ -9,21 +16,88 @@ import {
   GenerateContentParameters,
   FinishReason,
   Part,
+  ToolListUnion,
   FunctionCall,
   FunctionResponse,
 } from '@google/genai';
 import type {
   ChatCompletion,
   ChatCompletionChunk,
-  OpenAIRequestFormat,
 } from 'openai/resources/chat/index.js';
 
+// OpenAI API type definitions for conversions
+export interface OpenAIToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface OpenAIMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: OpenAIToolCall[];
+  tool_call_id?: string;
+}
+
+export interface OpenAIRequestFormat {
+  model: string;
+  messages: OpenAIMessage[];
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  tools?: unknown[];
+}
+
 /**
- * Utility class for converting between OpenAI and Gemini API formats
+ * Utility class for converting between OpenAI and Gemini API formats with robust error handling.
+ * 
+ * This class provides static methods for translating between Google's Gemini API format and
+ * OpenAI's chat completion format. It includes advanced error handling for streaming responses,
+ * malformed JSON parsing, and message consolidation to ensure reliable API integration.
+ * 
+ * The main features include:
+ * - Safe JSON parsing with fallback mechanisms for malformed data
+ * - Message consolidation for streaming responses
+ * - Tool call validation and cleanup
+ * - Type conversion between different AI API schemas
+ * 
+ * @example
+ * ```typescript
+ * // Convert Gemini request to OpenAI format
+ * const geminiRequest = { contents: [{ role: "user", parts: [{ text: "Hello" }] }] };
+ * const openaiRequest = OpenAIFormatConverter.convertGeminiParametersToOpenAI(geminiRequest, "gpt-4");
+ * ```
+ * 
+ * @example
+ * ```typescript
+ * // Safely parse potentially malformed JSON
+ * const malformed = '{"name": "test", "value": 123';
+ * const result = OpenAIFormatConverter.safeJsonParse(malformed);
+ * // Result: { name: "test", value: 123 }
+ * ```
  */
 export class OpenAIFormatConverter {
   /**
    * Convert Gemini tools to OpenAI format
+   */
+  /**
+   * Converts a collection of Gemini tools to OpenAI format for API compatibility.
+   * 
+   * This method takes Gemini tool definitions and transforms them into the format
+   * expected by OpenAI's chat completions API, specifically handling function declarations
+   * which are the primary tool type supported by both platforms.
+   * 
+   * @param geminiTools - Array of Gemini tool definitions to convert
+   * @returns Promise resolving to array of OpenAI-compatible tool definitions
+   * 
+   * @example
+   * ```typescript
+   * const geminiTools = [{ functionDeclarations: [{ name: "search", description: "Search for info" }] }];
+   * const openaiTools = await OpenAIFormatConverter.convertGeminiToolsToOpenAI(geminiTools);
+   * ```
    */
   static async convertGeminiToolsToOpenAI(
     geminiTools: ToolListUnion,
@@ -81,11 +155,11 @@ export class OpenAIFormatConverter {
 
           // Handle function calls and responses
           const functionCalls = (content.parts || []).filter(
-            (part): part is FunctionCall => 'functionCall' in part
+            (part): part is { functionCall: FunctionCall } => 'functionCall' in part
           );
 
           const functionResponses = (content.parts || []).filter(
-            (part): part is FunctionResponse => 'functionResponse' in part
+            (part): part is { functionResponse: FunctionResponse } => 'functionResponse' in part
           );
 
           if (functionCalls.length > 0) {
@@ -93,8 +167,8 @@ export class OpenAIFormatConverter {
               id: `call_${Date.now()}_${index}`,
               type: 'function' as const,
               function: {
-                name: fc.functionCall.name,
-                arguments: JSON.stringify(fc.functionCall.args || {}),
+                name: fc.functionCall?.name || 'unknown',
+                arguments: JSON.stringify(fc.functionCall?.args || {}),
               },
             }));
 
@@ -352,6 +426,46 @@ export class OpenAIFormatConverter {
   /**
    * Safely parse JSON with fallback handling for malformed input
    */
+  /**
+   * Provides a safe interface for JSON parsing with graceful error handling.
+   * 
+   * This method serves as the main entry point for safe JSON parsing operations,
+   * providing a fail-safe alternative to direct JSON.parse(). It automatically
+   * falls back to partial JSON extraction when standard parsing fails.
+   * 
+   * This is particularly useful in contexts where:
+   * - JSON data comes from external sources (APIs, streaming)
+   * - Data may be incomplete or corrupted during transmission
+   * - Robust error handling is required without throwing exceptions
+   * 
+   * The method internally uses {@link extractPartialJson} for fallback parsing,
+   * which can handle various forms of malformed JSON including:
+   * - Missing closing braces or brackets
+   * - Trailing commas
+   * - Incomplete string values
+   * - Partial object properties
+   * 
+   * @param input - The JSON string to parse safely
+   * @returns A parsed JavaScript object, or an empty object if parsing fails
+   * 
+   * @example
+   * ```typescript
+   * // Standard valid JSON
+   * const valid = '{"status": "success", "count": 42}';
+   * const result = this.safeJsonParse(valid);
+   * console.log(result); // { status: "success", count: 42 }
+   * ```
+   * 
+   * @example
+   * ```typescript
+   * // Malformed JSON that would normally throw
+   * const malformed = '{"status": "success", "count": 42,}';
+   * const result = this.safeJsonParse(malformed);
+   * console.log(result); // { status: "success", count: 42 }
+   * ```
+   * 
+   * @see {@link extractPartialJson} for the underlying partial parsing implementation
+   */
   private static safeJsonParse(input: string): Record<string, unknown> {
     try {
       return JSON.parse(input);
@@ -362,8 +476,43 @@ export class OpenAIFormatConverter {
   }
 
   /**
-   * Extract valid JSON from potentially partial JSON string
-   * This handles cases where streaming chunks contain incomplete JSON
+   * Safely extracts valid JSON from potentially malformed or incomplete JSON strings.
+   * 
+   * This method is designed to handle cases where streaming chunks contain incomplete JSON,
+   * such as during OpenAI API streaming responses where tool call arguments may be split
+   * across multiple chunks. It employs a multi-stage parsing strategy to maximize success rate.
+   * 
+   * The parsing strategy includes:
+   * 1. Direct JSON parsing for already valid JSON
+   * 2. Character-by-character parsing to find valid object boundaries
+   * 3. Manual key-value extraction for severely malformed cases
+   * 4. Graceful fallback to empty object on complete failure
+   * 
+   * This is particularly useful when dealing with:
+   * - Streaming API responses that may be interrupted
+   * - Network issues that cause partial data transmission
+   * - Malformed JSON from third-party services
+   * 
+   * @param input - The potentially malformed JSON string to parse
+   * @returns A parsed JavaScript object, or an empty object if parsing completely fails
+   * 
+   * @example
+   * ```typescript
+   * // Handle streaming chunk with incomplete JSON
+   * const chunk = '{"name": "test", "value": 123';
+   * const result = this.extractPartialJson(chunk);
+   * console.log(result); // { name: "test", value: 123 }
+   * ```
+   * 
+   * @example
+   * ```typescript
+   * // Handle completely malformed input gracefully
+   * const bad = 'this is not json at all';
+   * const result = this.extractPartialJson(bad);
+   * console.log(result); // {}
+   * ```
+   * 
+   * @see {@link safeJsonParse} for the public interface that calls this method
    */
   private static extractPartialJson(input: string): Record<string, unknown> {
     if (!input || typeof input !== 'string') {

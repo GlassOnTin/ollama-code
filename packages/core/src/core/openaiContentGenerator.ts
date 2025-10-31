@@ -923,6 +923,34 @@ export class OpenAIContentGenerator implements ContentGenerator {
   /**
    * Clean up orphaned tool calls from message history to prevent OpenAI API errors
    */
+  /**
+   * Removes orphaned tool calls and their corresponding responses from message history.
+   * 
+   * This helper method prevents OpenAI API errors by ensuring that every tool call
+   * has a corresponding tool response, and that all tool responses correspond to
+   * actual tool calls. This is crucial for maintaining valid message sequences
+   * when dealing with streaming responses or complex tool call patterns.
+   * 
+   * The method performs a two-pass cleaning process:
+   * 1. First pass: Collect all tool call and response IDs
+   * 2. Second pass: Filter messages to keep only valid tool call/response pairs
+   * 3. Final validation: Ensure no orphaned messages remain
+   * 
+   * @param messages - Array of OpenAI message objects to clean
+   * @returns Cleaned array of messages with orphaned tool calls removed
+   * 
+   * @example
+   * ```typescript
+   * // Before: Invalid message sequence with orphaned tool call
+   * const messages = [
+   *   { role: 'assistant', tool_calls: [{ id: '1', function: { name: 'search', arguments: '{}' } }] },
+   *   { role: 'user', content: 'some response' } // Missing tool response for call '1'
+   * ];
+   * 
+   * const cleaned = this.cleanOrphanedToolCalls(messages);
+   * // Result: Only valid messages remain, orphaned tool call is removed or content is preserved
+   * ```
+   */
   private cleanOrphanedToolCalls(
     messages: OpenAI.Chat.ChatCompletionMessageParam[],
   ): OpenAI.Chat.ChatCompletionMessageParam[] {
@@ -1074,6 +1102,36 @@ export class OpenAIContentGenerator implements ContentGenerator {
   /**
    * Merge consecutive assistant messages to combine split text and tool calls
    */
+  /**
+   * Merges consecutive assistant messages to combine split text and tool calls.
+   * 
+   * During streaming or complex tool interactions, OpenAI responses may be split
+   * into multiple consecutive assistant messages. This method consolidates these
+   * into single messages by combining their content and tool calls, which is
+   * required for proper API compatibility and message flow.
+   * 
+   * The merging process:
+   * 1. Combines text content from consecutive assistant messages
+   * 2. Merges tool calls from both messages
+   * 3. Preserves the chronological order of all elements
+   * 4. Only merges consecutive assistant messages (doesn't cross message types)
+   * 
+   * @param messages - Array of OpenAI message objects to merge
+   * @returns Array with consecutive assistant messages consolidated
+   * 
+   * @example
+   * ```typescript
+   * // Before: Split assistant messages
+   * const messages = [
+   *   { role: 'assistant', content: 'Here is ' },
+   *   { role: 'assistant', content: 'my response', tool_calls: [{ id: '1', function: { name: 'search', arguments: '{}' } }] },
+   *   { role: 'user', content: 'Continue' }
+   * ];
+   * 
+   * const merged = this.mergeConsecutiveAssistantMessages(messages);
+   * // Result: Single assistant message with combined content and tool calls
+   * ```
+   */
   private mergeConsecutiveAssistantMessages(
     messages: OpenAI.Chat.ChatCompletionMessageParam[],
   ): OpenAI.Chat.ChatCompletionMessageParam[] {
@@ -1149,11 +1207,11 @@ export class OpenAIContentGenerator implements ContentGenerator {
       for (const toolCall of choice.message.tool_calls) {
         if (toolCall.function) {
           let args: Record<string, unknown> = {};
-          if (toolCall.function.arguments) {
+          if (toolCall.function?.arguments) {
             try {
               args = JSON.parse(toolCall.function.arguments);
-            } catch (error) {
-              console.error('Failed to parse function arguments:', error);
+            } catch (parseError) {
+              console.error('Failed to parse function arguments:', parseError);
               console.error('Problematic arguments:', toolCall.function.arguments);
               // Try to extract partial JSON or provide a fallback
               args = this.extractPartialJson(toolCall.function.arguments) || {};
@@ -1270,10 +1328,10 @@ export class OpenAIContentGenerator implements ContentGenerator {
             if (accumulatedCall.arguments) {
               try {
                 args = JSON.parse(accumulatedCall.arguments);
-              } catch (error) {
+              } catch (parseError) {
                 console.error(
                   'Failed to parse final tool call arguments:',
-                  error,
+                  parseError,
                 );
                 console.error('Problematic accumulated arguments:', accumulatedCall.arguments);
                 // Try to extract partial JSON or provide a fallback
@@ -1828,68 +1886,83 @@ export class OpenAIContentGenerator implements ContentGenerator {
    * Extract valid JSON from potentially partial JSON string
    * This handles cases where streaming chunks contain incomplete JSON
    */
+  /**
+   * Extracts valid JSON from potentially malformed or incomplete JSON strings.
+   * This method handles common issues in streaming responses where JSON chunks may be incomplete.
+   * 
+   * This is particularly useful for handling OpenAI streaming responses where tool call arguments
+   * may be split across multiple chunks, resulting in partial JSON that needs reconstruction.
+   * 
+   * The method employs multiple fallback strategies:
+   * 1. Direct JSON parsing (for already valid JSON)
+   * 2. Fixing trailing commas and missing closing braces/brackets
+   * 3. Manual key-value pair extraction for simple cases
+   * 4. Quote character normalization (single to double quotes)
+   * 
+   * @param input - The potentially malformed JSON string to parse
+   * @returns A parsed JavaScript object, or null if parsing fails
+   * 
+   * @example
+   * ```typescript
+   * // Handles incomplete JSON from streaming
+   * const malformed = '{"key1": "value1", "key2": ';
+   * const result = this.extractPartialJson(malformed);
+   * console.log(result); // { key1: "value1" }
+   * ```
+   * 
+   * @example
+   * ```typescript
+   * // Fixes trailing commas
+   * const withComma = '{"name": "test",}';
+   * const result = this.extractPartialJson(withComma);
+   * console.log(result); // { name: "test" }
+   * ```
+   */
   private extractPartialJson(input: string): Record<string, unknown> | null {
     if (!input || typeof input !== 'string') {
       return null;
     }
 
+    const trimmed = input.trim();
+
     // First try to parse the entire string
     try {
-      return JSON.parse(input);
+      return JSON.parse(trimmed);
     } catch {
       // If that fails, try to find valid JSON patterns
     }
 
-    // Try to find a complete JSON object in the string
-    // This handles cases like: {"key": "value_partial
-    // or: {"key": "value"}
-    const trimmed = input.trim();
+    // Handle common malformed JSON cases
+    let fixedInput = trimmed;
+
+    // Fix common issues:
+    // 1. Remove trailing commas
+    fixedInput = fixedInput.replace(/,\s*([}\]])/g, '$1');
     
-    // Check if it looks like a complete object
-    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-      // Try to parse character by character to find where it breaks
-      let braceCount = 0;
-      let inString = false;
-      let escapeNext = false;
-      
-      for (let i = 0; i < trimmed.length; i++) {
-        const char = trimmed[i];
-        
-        if (escapeNext) {
-          escapeNext = false;
-          continue;
-        }
-        
-        if (char === '\\') {
-          escapeNext = true;
-          continue;
-        }
-        
-        if (char === '"' && !escapeNext) {
-          inString = !inString;
-          continue;
-        }
-        
-        if (!inString) {
-          if (char === '{') braceCount++;
-          else if (char === '}') braceCount--;
-          
-          // If we have balanced braces and are at the end, try parsing
-          if (braceCount === 0 && i === trimmed.length - 1) {
-            try {
-              return JSON.parse(trimmed);
-            } catch {
-              // Still not valid, continue
-            }
-          }
-        }
-      }
+    // 2. Add missing closing braces/brackets if possible
+    const openBraces = (fixedInput.match(/\{/g) || []).length;
+    const closeBraces = (fixedInput.match(/\}/g) || []).length;
+    const openBrackets = (fixedInput.match(/\[/g) || []).length;
+    const closeBrackets = (fixedInput.match(/\]/g) || []).length;
+
+    for (let i = 0; i < openBraces - closeBraces; i++) {
+      fixedInput += '}';
+    }
+    for (let i = 0; i < openBrackets - closeBrackets; i++) {
+      fixedInput += ']';
+    }
+
+    // Try to parse the fixed input
+    try {
+      return JSON.parse(fixedInput);
+    } catch {
+      // If still fails, try to extract key-value pairs
     }
 
     // Try to extract key-value pairs manually for simple cases
     // This handles: key1="value1",key2="value2" 
-    const keyValuePattern = /"([^"]+)"\s*:\s*("([^"]*)"|([0-9.]+)|(true|false)|(null))/g;
-    const matches = [...trimmed.matchAll(keyValuePattern)];
+    const keyValuePattern = /"([^"]+)"\s*:\s*("([^"]*)"|([^,}\]]+))/g;
+    const matches = [...fixedInput.matchAll(keyValuePattern)];
     
     if (matches.length > 0) {
       const result: Record<string, unknown> = {};
@@ -1902,27 +1975,35 @@ export class OpenAIContentGenerator implements ContentGenerator {
           // String value
           value = match[3];
         } else if (match[4] !== undefined) {
-          // Number value
-          value = parseFloat(match[4]);
-          if (Number.isNaN(value)) {
-            value = match[4];
+          // Try to parse as number, boolean, or leave as string
+          const rawValue = match[4].trim();
+          if (rawValue === 'true' || rawValue === 'false') {
+            value = rawValue === 'true';
+          } else if (!isNaN(Number(rawValue)) && rawValue !== '') {
+            value = Number(rawValue);
+          } else {
+            value = rawValue;
           }
-        } else if (match[5] !== undefined) {
-          // Boolean value
-          value = match[5] === 'true';
-        } else if (match[6] !== undefined) {
-          // Null value
-          value = null;
         }
         
-        result[key] = value;
+        if (key && value !== undefined) {
+          result[key] = value;
+        }
       }
       
-      return result;
+      return Object.keys(result).length > 0 ? result : null;
     }
 
-    // Last resort: return an empty object rather than throwing
-    console.warn('Could not extract valid JSON from:', input);
+    // Last resort: try to fix single quotes to double quotes
+    const singleQuoteFixed = fixedInput.replace(/'/g, '"');
+    try {
+      return JSON.parse(singleQuoteFixed);
+    } catch {
+      // Still not valid
+    }
+
+    // Final fallback: return empty object rather than throwing
+    console.warn('Could not extract valid JSON from:', input, 'Fixed version:', fixedInput);
     return null;
   }
 }
