@@ -1208,13 +1208,11 @@ export class OpenAIContentGenerator implements ContentGenerator {
         if (toolCall.function) {
           let args: Record<string, unknown> = {};
           if (toolCall.function?.arguments) {
-            try {
-              args = JSON.parse(toolCall.function.arguments);
-            } catch (parseError) {
-              console.error('Failed to parse function arguments:', parseError);
-              console.error('Problematic arguments:', toolCall.function.arguments);
-              // Try to extract partial JSON or provide a fallback
-              args = this.extractPartialJson(toolCall.function.arguments) || {};
+            // Use robust JSON parsing to handle malformed responses from Ollama
+            const parsedArgs = this.extractPartialJson(toolCall.function.arguments);
+            args = parsedArgs || {};
+            if (!parsedArgs) {
+              console.warn('Could not parse function arguments, using empty object:', toolCall.function.arguments);
             }
           }
 
@@ -1326,16 +1324,11 @@ export class OpenAIContentGenerator implements ContentGenerator {
           if (accumulatedCall.name) {
             let args: Record<string, unknown> = {};
             if (accumulatedCall.arguments) {
-              try {
-                args = JSON.parse(accumulatedCall.arguments);
-              } catch (parseError) {
-                console.error(
-                  'Failed to parse final tool call arguments:',
-                  parseError,
-                );
-                console.error('Problematic accumulated arguments:', accumulatedCall.arguments);
-                // Try to extract partial JSON or provide a fallback
-                args = this.extractPartialJson(accumulatedCall.arguments) || {};
+              // Use robust JSON parsing to handle malformed streaming responses from Ollama
+              const parsedArgs = this.extractPartialJson(accumulatedCall.arguments);
+              args = parsedArgs || {};
+              if (!parsedArgs) {
+                console.warn('Could not parse accumulated tool call arguments, using empty object:', accumulatedCall.arguments);
               }
             }
 
@@ -1925,10 +1918,12 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
     const trimmed = input.trim();
 
-    // First try to parse the entire string
+    // First try to parse the entire string with better error logging
     try {
       return JSON.parse(trimmed);
-    } catch {
+    } catch (initialError) {
+      const errorMessage = initialError instanceof Error ? initialError.message : String(initialError);
+      console.warn('Initial JSON.parse failed:', errorMessage);
       // If that fails, try to find valid JSON patterns
     }
 
@@ -1952,11 +1947,13 @@ export class OpenAIContentGenerator implements ContentGenerator {
       fixedInput += ']';
     }
 
-    // Try to parse the fixed input
+    // Try to parse the fixed input with robust error handling
     try {
       return JSON.parse(fixedInput);
-    } catch {
+    } catch (fixedError) {
       // If still fails, try to extract key-value pairs
+      const errorMessage = fixedError instanceof Error ? fixedError.message : String(fixedError);
+      console.warn('Failed to parse fixed JSON input:', fixedInput, 'Error:', errorMessage);
     }
 
     // Try to extract key-value pairs manually for simple cases
@@ -1998,12 +1995,13 @@ export class OpenAIContentGenerator implements ContentGenerator {
     const singleQuoteFixed = fixedInput.replace(/'/g, '"');
     try {
       return JSON.parse(singleQuoteFixed);
-    } catch {
-      // Still not valid
+    } catch (singleQuoteError) {
+      const errorMessage = singleQuoteError instanceof Error ? singleQuoteError.message : String(singleQuoteError);
+      console.warn('Failed to parse single-quote-fixed JSON:', singleQuoteFixed, 'Error:', errorMessage);
     }
 
-    // Final fallback: return empty object rather than throwing
-    console.warn('Could not extract valid JSON from:', input, 'Fixed version:', fixedInput);
+    // Final fallback: return empty object rather than throwing to ensure API continues to work
+    console.warn('All JSON parsing methods failed. Could not extract valid JSON from:', input);
     return null;
   }
 }
