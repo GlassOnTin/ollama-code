@@ -1,11 +1,18 @@
 #!/usr/bin/env node
 
 /**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ *
  * JSON Parsing Fix Verification Script
  * 
  * This script verifies that the "unmarshal: invalid character '{' after top-level value" 
  * errors have been resolved in the Ollama Code OpenAI content generator.
  */
+
+// global console - this is a Node.js script where console is available
+// eslint-disable-next-line no-console, no-undef
 
 console.log('🔧 JSON Parsing Fix Verification for Ollama Code\n');
 
@@ -151,7 +158,7 @@ testCases.forEach((testCase, index) => {
   let originalFailed = false;
   try {
     JSON.parse(testCase.input);
-  } catch (originalError) {
+  } catch {
     originalFailed = true;
   }
 

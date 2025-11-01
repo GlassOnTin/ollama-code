@@ -1,10 +1,13 @@
 /**
- * @fileoverview
- * OpenAI Format Converter Utility
- * 
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * This module provides utilities for converting between Google's Gemini API format
  * and OpenAI's chat completion format. It handles the translation of messages,
- * tools, and responses between the two different API schemas.
+ * tools, and responses between the different API schemas.
  * 
  * @license
  * Copyright 2025 Google LLC
@@ -492,6 +495,7 @@ export class OpenAIFormatConverter {
    * - Streaming API responses that may be interrupted
    * - Network issues that cause partial data transmission
    * - Malformed JSON from third-party services
+   * - Valid JSON followed by extra text (e.g., "{\"key\":\"value\"} extra text")
    * 
    * @param input - The potentially malformed JSON string to parse
    * @returns A parsed JavaScript object, or an empty object if parsing completely fails
@@ -502,6 +506,14 @@ export class OpenAIFormatConverter {
    * const chunk = '{"name": "test", "value": 123';
    * const result = this.extractPartialJson(chunk);
    * console.log(result); // { name: "test", value: 123 }
+   * ```
+   * 
+   * @example
+   * ```typescript
+   * // Handle valid JSON followed by extra text
+   * const chunk = '{"name": "test"} some extra text';
+   * const result = this.extractPartialJson(chunk);
+   * console.log(result); // { name: "test" }
    * ```
    * 
    * @example
@@ -519,22 +531,38 @@ export class OpenAIFormatConverter {
       return {};
     }
 
+    const trimmed = input.trim();
+
     // First try to parse the entire string
     try {
-      return JSON.parse(input);
+      return JSON.parse(trimmed);
     } catch {
       // If that fails, try to find valid JSON patterns
     }
 
-    // Try to find a complete JSON object in the string
-    const trimmed = input.trim();
+    // Handle case where there's valid JSON followed by extra text
+    // This is the specific case causing "Unexpected non-whitespace character after JSON"
+    const braceStart = trimmed.indexOf('{');
+    const braceEnd = trimmed.lastIndexOf('}');
     
+    if (braceStart !== -1 && braceEnd !== -1 && braceEnd > braceStart) {
+      // Extract the JSON portion between the first { and last }
+      const jsonPart = trimmed.substring(braceStart, braceEnd + 1);
+      try {
+        return JSON.parse(jsonPart);
+      } catch {
+        // If the extracted JSON still fails, continue with other methods
+      }
+    }
+
+    // Try to find a complete JSON object in the string
     // Check if it looks like a complete object
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       // Try to parse character by character to find where it breaks
       let braceCount = 0;
       let inString = false;
       let escapeNext = false;
+      let lastValidPos = -1;
       
       for (let i = 0; i < trimmed.length; i++) {
         const char = trimmed[i];
@@ -558,14 +586,20 @@ export class OpenAIFormatConverter {
           if (char === '{') braceCount++;
           else if (char === '}') braceCount--;
           
-          // If we have balanced braces and are at the end, try parsing
-          if (braceCount === 0 && i === trimmed.length - 1) {
-            try {
-              return JSON.parse(trimmed);
-            } catch {
-              // Still not valid, continue
-            }
+          // Track position of balanced braces
+          if (braceCount === 0) {
+            lastValidPos = i;
           }
+        }
+      }
+      
+      // If we found a valid complete JSON object, try parsing it
+      if (lastValidPos > 0) {
+        const validJson = trimmed.substring(0, lastValidPos + 1);
+        try {
+          return JSON.parse(validJson);
+        } catch {
+          // Still not valid, continue
         }
       }
     }
@@ -602,6 +636,36 @@ export class OpenAIFormatConverter {
       }
       
       return result;
+    }
+
+    // Try to handle simple comma-separated key-value pairs without quotes
+    const simplePattern = /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^,}\]]+)/g;
+    const simpleMatches = [...trimmed.matchAll(simplePattern)];
+    
+    if (simpleMatches.length > 0) {
+      const result: Record<string, unknown> = {};
+      
+      for (const match of simpleMatches) {
+        const key = match[1];
+        const rawValue = match[2].trim();
+        let value: unknown;
+        
+        if (rawValue === 'true' || rawValue === 'false') {
+          value = rawValue === 'true';
+        } else if (!isNaN(Number(rawValue)) && rawValue !== '') {
+          value = Number(rawValue);
+        } else if (rawValue === 'null') {
+          value = null;
+        } else {
+          value = rawValue.replace(/^"|"$/g, ''); // Remove quotes if present
+        }
+        
+        result[key] = value;
+      }
+      
+      if (Object.keys(result).length > 0) {
+        return result;
+      }
     }
 
     // Last resort: return an empty object rather than throwing

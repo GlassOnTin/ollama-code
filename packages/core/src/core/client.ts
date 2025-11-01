@@ -342,6 +342,104 @@ export class GeminiClient {
     return turn;
   }
 
+  /**
+   * Extract valid JSON from potentially malformed or incomplete JSON strings.
+   * This method handles common issues in API responses where JSON chunks may be incomplete.
+   */
+  private extractPartialJson(input: string): Record<string, unknown> | null {
+    if (!input || typeof input !== 'string') {
+      return null;
+    }
+
+    const trimmed = input.trim();
+
+    // First try to parse the entire string with better error logging
+    try {
+      return JSON.parse(trimmed);
+    } catch (initialError) {
+      const errorMessage = initialError instanceof Error ? initialError.message : String(initialError);
+      console.warn('Initial JSON.parse failed:', errorMessage);
+      // If that fails, try to find valid JSON patterns
+    }
+
+    // Handle common malformed JSON cases
+    let fixedInput = trimmed;
+
+    // Fix common issues:
+    // 1. Remove trailing commas
+    fixedInput = fixedInput.replace(/,\s*([}\]])/g, '$1');
+    
+    // 2. Add missing closing braces/brackets if possible
+    const openBraces = (fixedInput.match(/\{/g) || []).length;
+    const closeBraces = (fixedInput.match(/\}/g) || []).length;
+    const openBrackets = (fixedInput.match(/\[/g) || []).length;
+    const closeBrackets = (fixedInput.match(/\]/g) || []).length;
+
+    for (let i = 0; i < openBraces - closeBraces; i++) {
+      fixedInput += '}';
+    }
+    for (let i = 0; i < openBrackets - closeBrackets; i++) {
+      fixedInput += ']';
+    }
+
+    // Try to parse the fixed input with robust error handling
+    try {
+      return JSON.parse(fixedInput);
+    } catch (fixedError) {
+      // If still fails, try to extract key-value pairs
+      const errorMessage = fixedError instanceof Error ? fixedError.message : String(fixedError);
+      console.warn('Failed to parse fixed JSON input:', fixedInput, 'Error:', errorMessage);
+    }
+
+    // Try to extract key-value pairs manually for simple cases
+    // This handles: key1="value1",key2="value2" 
+    const keyValuePattern = /"([^"]+)"\s*:\s*("([^"]*)"|([^,}\]]+))/g;
+    const matches = [...fixedInput.matchAll(keyValuePattern)];
+    
+    if (matches.length > 0) {
+      const result: Record<string, unknown> = {};
+      
+      for (const match of matches) {
+        const key = match[1];
+        let value: unknown;
+        
+        if (match[3] !== undefined) {
+          // String value
+          value = match[3];
+        } else if (match[4] !== undefined) {
+          // Try to parse as number, boolean, or leave as string
+          const rawValue = match[4].trim();
+          if (rawValue === 'true' || rawValue === 'false') {
+            value = rawValue === 'true';
+          } else if (!isNaN(Number(rawValue)) && rawValue !== '') {
+            value = Number(rawValue);
+          } else {
+            value = rawValue;
+          }
+        }
+        
+        if (key && value !== undefined) {
+          result[key] = value;
+        }
+      }
+      
+      return Object.keys(result).length > 0 ? result : null;
+    }
+
+    // Last resort: try to fix single quotes to double quotes
+    const singleQuoteFixed = fixedInput.replace(/'/g, '"');
+    try {
+      return JSON.parse(singleQuoteFixed);
+    } catch (singleQuoteError) {
+      const errorMessage = singleQuoteError instanceof Error ? singleQuoteError.message : String(singleQuoteError);
+      console.warn('Failed to parse single-quote-fixed JSON:', singleQuoteFixed, 'Error:', errorMessage);
+    }
+
+    // Final fallback: return empty object rather than throwing to ensure API continues to work
+    console.warn('All JSON parsing methods failed. Could not extract valid JSON from:', input);
+    return null;
+  }
+
   async generateJson(
     contents: Content[],
     schema: SchemaUnion,
@@ -406,17 +504,22 @@ export class GeminiClient {
         for (const regex of extractors) {
           const match = text.match(regex);
           if (match && match[1]) {
-            try {
-              return JSON.parse(match[1].trim());
-            } catch {
-              // Continue to next pattern if parsing fails
-              continue;
+            // Use robust JSON parsing to handle malformed responses
+            const parsedResult = this.extractPartialJson(match[1].trim());
+            if (parsedResult) {
+              return parsedResult;
             }
           }
         }
 
-        // If no patterns matched, try parsing the entire text
-        return JSON.parse(text.trim());
+        // If no patterns matched, try parsing the entire text with robust parsing
+        const finalResult = this.extractPartialJson(text.trim());
+        if (finalResult) {
+          return finalResult;
+        }
+
+        // If all methods fail, throw a more descriptive error
+        throw new Error('Could not extract valid JSON from response');
       } catch (parseError) {
         await reportError(
           parseError,

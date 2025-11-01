@@ -157,7 +157,7 @@ export default tseslint.config(
   },
   // extra settings for scripts that we run directly with node
   {
-    files: ['./scripts/**/*.js', 'esbuild.config.js'],
+    files: ['./scripts/**/*.js', 'esbuild.config.js', 'json-fix-verification.js', 'migrate-mcp-config.sh'],
     languageOptions: {
       globals: {
         ...globals.node,
