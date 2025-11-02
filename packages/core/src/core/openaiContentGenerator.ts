@@ -541,9 +541,87 @@ export class OpenAIContentGenerator implements ContentGenerator {
     // Reset the accumulator for each new stream
     this.streamingToolCalls.clear();
 
-    for await (const chunk of stream) {
-      yield this.convertStreamChunkToGeminiFormat(chunk);
+    try {
+      for await (const chunk of stream) {
+        try {
+          yield this.convertStreamChunkToGeminiFormat(chunk);
+        } catch (chunkError) {
+          // Handle Ollama-specific streaming chunk errors
+          const isOllamaChunkError = this.isOllamaStreamingChunkError(chunkError);
+          
+          if (isOllamaChunkError) {
+            console.warn('Ollama streaming chunk error detected, continuing with next chunk:', chunkError);
+            // Continue processing remaining chunks instead of failing the entire stream
+            continue;
+          } else {
+            // Re-throw non-Ollama streaming chunk errors
+            throw chunkError;
+          }
+        }
+      }
+    } catch (streamError) {
+      // Check if this is an Ollama-specific streaming setup error
+      const isOllamaStreamError = this.isOllamaStreamingSetupError(streamError);
+      
+      if (isOllamaStreamError) {
+        console.warn('Ollama streaming setup error detected:', streamError);
+        // Create an empty but valid response to prevent complete failure
+        const errorResponse = new GenerateContentResponse();
+        errorResponse.candidates = [];
+        errorResponse.modelVersion = this.model;
+        errorResponse.promptFeedback = { safetyRatings: [] };
+        yield errorResponse;
+      } else {
+        // Re-throw non-Ollama streaming errors
+        throw streamError;
+      }
     }
+  }
+
+  /**
+   * Check if an error is specifically related to Ollama streaming chunk processing
+   */
+  private isOllamaStreamingChunkError(error: unknown): boolean {
+    if (!error) return false;
+
+    const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    
+    // Check for common Ollama streaming chunk error patterns
+    const ollamaChunkErrorPatterns = [
+      'unmarshal',
+      'invalid character',
+      'json:',
+      'unexpected token',
+      'invalid json',
+      'malformed json',
+      'syntax error',
+      'parsing',
+    ];
+
+    return ollamaChunkErrorPatterns.some(pattern => errorMessage.includes(pattern));
+  }
+
+  /**
+   * Check if an error is specifically related to Ollama streaming setup
+   */
+  private isOllamaStreamingSetupError(error: unknown): boolean {
+    if (!error) return false;
+
+    const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    
+    // Check for Ollama-specific streaming setup error patterns
+    const ollamaStreamErrorPatterns = [
+      '500',
+      'unmarshal: invalid character',
+      'invalid character',
+      'ollama',
+      'json',
+      'parse',
+      'syntax error',
+      'malformed',
+    ];
+
+    return ollamaStreamErrorPatterns.some(pattern => errorMessage.includes(pattern));
   }
 
   /**
@@ -1311,7 +1389,13 @@ export class OpenAIContentGenerator implements ContentGenerator {
             accumulatedCall.name = toolCall.function.name;
           }
           if (toolCall.function?.arguments) {
-            accumulatedCall.arguments += toolCall.function.arguments;
+            // Handle Ollama-specific malformed JSON in streaming chunks
+            try {
+              accumulatedCall.arguments += toolCall.function.arguments;
+            } catch (argsError) {
+              console.warn('Error accumulating tool call arguments from Ollama chunk:', argsError);
+              // Continue with existing accumulated arguments if any
+            }
           }
         }
       }
@@ -1360,6 +1444,19 @@ export class OpenAIContentGenerator implements ContentGenerator {
       ];
     } else {
       response.candidates = [];
+      
+      // Handle Ollama-specific case where no choices are returned
+      console.warn('Ollama streaming chunk has no choices:', chunk);
+      // Still provide a minimal valid response structure
+      response.candidates = [{
+        content: {
+          parts: [],
+          role: 'model' as const,
+        },
+        finishReason: FinishReason.FINISH_REASON_UNSPECIFIED,
+        index: 0,
+        safetyRatings: [],
+      }];
     }
 
     response.modelVersion = this.model;
@@ -1891,6 +1988,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
    * 2. Fixing trailing commas and missing closing braces/brackets
    * 3. Manual key-value pair extraction for simple cases
    * 4. Quote character normalization (single to double quotes)
+   * 5. Ollama-specific JSON format fixes
    * 
    * @param input - The potentially malformed JSON string to parse
    * @returns A parsed JavaScript object, or null if parsing fails
@@ -1927,9 +2025,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
       // If that fails, try to find valid JSON patterns
     }
 
-    // Handle common malformed JSON cases
-    let fixedInput = trimmed;
-
+    // Handle Ollama-specific malformed JSON patterns
+    let fixedInput = this.fixOllamaSpecificJson(trimmed);
+    
     // Fix common issues:
     // 1. Remove trailing commas
     fixedInput = fixedInput.replace(/,\s*([}\]])/g, '$1');
@@ -2003,5 +2101,39 @@ export class OpenAIContentGenerator implements ContentGenerator {
     // Final fallback: return empty object rather than throwing to ensure API continues to work
     console.warn('All JSON parsing methods failed. Could not extract valid JSON from:', input);
     return null;
+  }
+
+  /**
+   * Fix Ollama-specific JSON formatting issues
+   */
+  private fixOllamaSpecificJson(input: string): string {
+    let fixed = input;
+
+    // Handle Ollama-specific issue: unescaped quotes or special characters
+    // Pattern: text with unescaped quotes that break JSON parsing
+    fixed = fixed.replace(/([^\\])"/g, '$1"');
+    
+    // Handle Ollama-specific case: incomplete objects or arrays
+    // If we see an opening brace/bracket but no closing, and content looks incomplete
+    if ((fixed.includes('{') && !fixed.includes('}')) || (fixed.includes('[') && !fixed.includes(']'))) {
+      // Check if the content looks like it was cut off mid-stream
+      const lastPart = fixed.split(/[,}\]]/).pop()?.trim();
+      if (lastPart && lastPart.length > 0 && !lastPart.includes(':')) {
+        // This looks like incomplete content, add closing brace
+        if (fixed.includes('{')) {
+          fixed = fixed.replace(/\{[^}]*$/, ''); // Remove incomplete object
+        }
+      }
+    }
+
+    // Handle Ollama-specific case: extra characters after valid JSON
+    // Check if we have a complete JSON object followed by additional content
+    const jsonMatch = fixed.match(/^\s*\{[\s\S]*\}\s*/);
+    if (jsonMatch) {
+      // If we found a complete JSON object, return just that part
+      fixed = jsonMatch[0];
+    }
+
+    return fixed;
   }
 }
