@@ -29,6 +29,7 @@
   },
   "dependencies": {
     "@tcsenpai/ollama-code": "file:../core",
+    "@tcsenpai/ollama-code-cli": "file:",
     "@types/update-notifier": "^6.0.8",
     "command-exists": "^1.2.9",
     "diff": "^7.0.0",
